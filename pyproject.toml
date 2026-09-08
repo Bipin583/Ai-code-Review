@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reviewbot-ai"
+version = "0.1.0"
+description = "AI-powered code review for GitHub PRs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.4.0",
+    "pygithub>=2.3.0",
+    "anthropic>=1.4.0",
+    "sqlalchemy>=2.0.30",
+    "streamlit>=1.37.0",
+    "plotly>=5.22.0",
+    "pandas>=2.2.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=5.0.0",
+]
+
+# `reviewbot` lives under src/, `configs` at the repo root. Both are listed so
+# that `configs.settings` keeps working after an editable/wheel install.
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["reviewbot*", "configs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["src", "."]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["reviewbot"]
