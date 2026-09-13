@@ -44,6 +44,13 @@ class AnalyzerError(RuntimeError):
     """A safe-to-report analyzer failure without credential content."""
 
 
+# GitHub owner and repository names: alphanumeric start, then alphanumerics,
+# dots, hyphens, underscores. Anything else (spaces, "..", "?", "#", extra
+# slashes) would be interpolated into an API URL path, so it is rejected
+# outright rather than sanitized.
+_FULL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
 @dataclass(frozen=True)
 class RunContext:
     repository: str
@@ -62,7 +69,7 @@ def parse_failed_pr_run(event: dict[str, Any]) -> RunContext | None:
     if not pulls:
         return None
     repository = (event.get("repository") or {}).get("full_name")
-    if not repository or "/" not in repository:
+    if not isinstance(repository, str) or not _FULL_NAME.fullmatch(repository):
         raise AnalyzerError("workflow event does not identify a valid repository")
     try:
         return RunContext(
@@ -89,11 +96,16 @@ _URL_CREDENTIALS = re.compile(r"(https?://)([^\s/@:]+)(?::[^\s/@]*)?@", re.IGNOR
 _QUERY_SECRET = re.compile(
     r"([?&](?:token|key|secret|password|signature|sig|api_key)=)[^&#\s]+", re.IGNORECASE
 )
+# The prompt wraps log text in literal <untrusted_ci_log_data> tags. A hostile
+# log line containing the closing tag would end the untrusted region early and
+# pass the rest of the log to the model as trusted prompt content, so the tags
+# themselves must never survive redaction.
+_MARKER_TAG = re.compile(r"<\s*/?\s*untrusted_ci_log_data[^>]*>", re.IGNORECASE)
 
 
 def redact_text(text: str, secrets: Iterable[str] = ()) -> str:
     """Remove configured secrets and common credential forms from untrusted logs."""
-    redacted = text
+    redacted = _MARKER_TAG.sub("[REDACTED-MARKER]", text)
     for secret in sorted({value for value in secrets if value}, key=len, reverse=True):
         redacted = redacted.replace(secret, "[REDACTED]")
     for pattern in _TOKEN_PATTERNS:
