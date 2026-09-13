@@ -15,6 +15,7 @@ summary comment plus inline comments on the exact lines.
 | [api-reference.md](api-reference.md) | Every HTTP endpoint with request/response examples |
 | [database.md](database.md) | Schema, JSON payload shapes, useful queries, PostgreSQL migration |
 | [deployment.md](deployment.md) | Docker, Railway, Render, production hardening checklist |
+| [railway-checklist.md](railway-checklist.md) | Copy-along Railway quick start: exact variables, database, webhook cutover |
 | [development.md](development.md) | Project layout, tests, and how to extend the bot |
 | [troubleshooting.md](troubleshooting.md) | Symptom → cause → fix for the failures you are likely to hit |
 

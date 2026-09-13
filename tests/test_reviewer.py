@@ -389,10 +389,12 @@ def test_walkthrough_is_generated_and_rendered(sample_diff):
     assert "### 🧭 Walkthrough" in summary
     assert summary.index("**Confidence:**") < summary.index("### 🧭 Walkthrough")
     assert summary.index("### 🧭 Walkthrough") < summary.index("### 📊 Breakdown")
-    # The walkthrough call is a separate, lighter request.
+    # The walkthrough call is a separate request sharing the global token cap:
+    # thinking models spend tokens reasoning before any text, so a small
+    # dedicated limit makes the call fail outright.
     walkthrough_call = messages.calls[-1]
     assert "technical writer" in walkthrough_call["system"]
-    assert walkthrough_call["max_tokens"] == 400
+    assert walkthrough_call["max_tokens"] == settings.llm_max_tokens
     assert "a.py: 1 issue(s) flagged" in walkthrough_call["messages"][0]["content"]
     assert "pull request" in walkthrough_call["messages"][0]["content"]
 

@@ -402,7 +402,10 @@ class CodeReviewer:
                     title=ctx.get("pr_title") or "(untitled)",
                     file_notes="\n".join(notes),
                 ),
-                max_tokens=400,
+                # No tighter cap than a file review: thinking models spend
+                # hundreds of tokens reasoning before any text, so a small
+                # dedicated limit makes the call fail outright.
+                max_tokens=settings.llm_max_tokens,
             )
         except Exception as exc:  # noqa: BLE001 - the walkthrough is optional
             logger.warning("Walkthrough generation failed: %s", exc)
