@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
 
@@ -35,6 +35,15 @@ class GitHubPR(BaseModel):
     created_at: datetime
     updated_at: datetime
     html_url: str
+
+
+class ComparisonResult(BaseModel):
+    """Normalized output of comparing two commits."""
+
+    files: List[GitHubFile]
+    total_commits: int = 0
+    ahead_by: int = 0
+    behind_by: int = 0
 
 
 class WebhookPayload(BaseModel):

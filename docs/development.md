@@ -7,17 +7,19 @@ src/reviewbot/
   api/       main.py      FastAPI app, lifespan, CORS, /, /health
              routes.py    /api/* read endpoints + manual trigger
              webhooks.py  /webhook/github, signature check, review pipeline
-  github/    client.py    PyGithub wrapper: fetch files, post comments
-             models.py    GitHubFile / PullRequestInfo dataclasses
-  llm/       reviewer.py  prompts, model call, normalization, aggregation
+  github/    client.py    PyGithub wrapper: fetch files, compare commits, post comments
+             models.py    GitHubFile / ComparisonResult / WebhookPayload models
+  llm/       reviewer.py  prompts, model call, normalization, aggregation, walkthrough
              parser.py    diff annotation, comment rendering, line validation
-  db/        database.py  engine, session, init_db, get_db
+  db/        database.py  engine, session, init_db (incl. add-column migration), get_db
              models.py    Review, ReviewComment
   dashboard/ app.py       Streamlit UI
   utils/     config.py    Settings (single source of truth)
+             repo_config.py  .reviewbot.yaml: parse, validate, cache, merge
 configs/settings.py       re-export, so `from configs.settings import settings` works
 dashboard/app.py          launcher: `streamlit run dashboard/app.py`
-tests/                    test_api.py, test_reviewer.py, test_github_client.py
+tests/                    test_api.py, test_reviewer.py, test_github_client.py,
+                          test_repo_config.py, test_database.py
 conftest.py               test bootstrap at the repo root
 ```
 
@@ -28,7 +30,9 @@ an editable install.
 
 The dependency direction is one-way: `api` uses `github`, `llm` and `db`; those three
 know nothing about `api` and nothing about each other, except that `llm/reviewer.py`
-imports helpers from `llm/parser.py`. Adding an import that points the other way is
+imports helpers from `llm/parser.py`. `utils/repo_config.py` imports only from
+`utils/config.py` — severity comparison stays in `api/webhooks.py`, so the config
+module never depends on `llm`. Adding an import that points the other way is
 the change to avoid.
 
 ## Setup

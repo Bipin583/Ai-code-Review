@@ -130,7 +130,14 @@ the URL path is wrong.
 ## 7. Trigger the first review
 
 Open a PR that changes a `.py` file. Within a minute or two the bot posts a summary
-comment and inline comments on the changed lines.
+comment (starting with a plain-English walkthrough of the change) and inline
+comments on the changed lines. Every later push to the PR triggers an incremental
+review covering only the delta since the last one.
+
+A repository can tune the bot by committing a `.reviewbot.yaml` — path filters,
+extra extensions, comment caps, a severity threshold, or `enabled: false` to turn
+it off. It is read at the PR base sha, so config changes take effect once merged;
+see [configuration.md](configuration.md).
 
 To test without a webhook or a public URL, call the manual endpoint — it runs the
 identical pipeline:

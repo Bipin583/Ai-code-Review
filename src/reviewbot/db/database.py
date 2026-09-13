@@ -65,8 +65,40 @@ def get_db():
 
 
 def init_db() -> None:
-    """Create any missing tables."""
+    """Create any missing tables, then add any columns introduced later."""
     from reviewbot.db import models  # noqa: F401  (register mappers)
 
     Base.metadata.create_all(bind=engine)
+    _add_missing_columns()
     logger.debug("Schema ensured for %s", DATABASE_URL)
+
+
+# Columns added after the first release. create_all does not ALTER existing
+# tables and this project has no Alembic, so these are added by hand. All are
+# nullable, which makes plain ALTER TABLE ... ADD COLUMN portable across
+# SQLite and PostgreSQL. Keep in sync with db/models.py.
+_EXPECTED_COLUMNS = {
+    "reviews": {
+        "base_commit_sha": "VARCHAR",
+        "walkthrough": "TEXT",
+    }
+}
+
+
+def _add_missing_columns() -> None:
+    """ALTER TABLE ... ADD COLUMN for schema drift between releases."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    for table, columns in _EXPECTED_COLUMNS.items():
+        if table not in inspector.get_table_names():
+            continue
+        existing = {col["name"] for col in inspector.get_columns(table)}
+        for name, ddl_type in columns.items():
+            if name in existing:
+                continue
+            with engine.begin() as conn:
+                conn.execute(
+                    text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl_type}")
+                )
+            logger.info("Added column %s.%s", table, name)

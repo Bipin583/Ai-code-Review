@@ -68,6 +68,51 @@ complex types read from the environment, so a `List[str]` field makes
 `CORS_ORIGINS=*` a startup crash and demands `["*"]` instead. Comma-separated
 strings keep `.env` files readable.
 
+## Per-repository configuration (`.reviewbot.yaml`)
+
+Environment variables configure the bot globally. A repository can override part of
+that behaviour by committing a `.reviewbot.yaml` at its root:
+
+```yaml
+# Only review files under src/ (quote globs: a bare * starts a YAML alias)
+include:
+  - "src/**"
+# ...except generated code and fixtures
+exclude:
+  - "src/legacy/**"
+  - "*_generated.py"
+# Review more than just Python
+extensions: [py, js, ts]
+# Fewer inline comments, higher bar
+max_inline_comments: 10
+min_severity: medium
+```
+
+| Key | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `include` | list of globs | — | When set, a file must match at least one glob to be reviewed. |
+| `exclude` | list of globs | `[]` | Files matching any glob are skipped. |
+| `extensions` | list of suffixes | global `REVIEW_FILE_EXTENSIONS` | Replaces the global list entirely (dots optional: `py` ≡ `.py`). |
+| `max_inline_comments` | int ≥ 0 | global `MAX_INLINE_COMMENTS` | Per-PR inline comment cap. |
+| `min_severity` | `high`/`medium`/`low` | `low` | Inline comments below this severity are not posted; the summary still lists every finding. |
+| `enabled` | bool | `true` | `false` disables the bot for the repository — no comments, no database row. |
+
+Rules worth knowing:
+
+- **Globs are `fnmatch` patterns** matched case-sensitively against the repo-relative
+  POSIX path. `*` crosses `/` (so `*.py` matches `a/b/c.py`); there is no brace
+  expansion. Quote patterns starting with `*` in YAML, or the parser reads them as
+  aliases.
+- **The config is read at the PR *base* sha**, so a pull request cannot weaken its
+  own review — adding `.reviewbot.yaml` with `enabled: false` to a PR has no effect
+  until that change lands on the base branch through the normal review path.
+- **Unknown keys are warned about and ignored**; malformed YAML or invalid values
+  fall back to the global config rather than skipping the review.
+- `MAX_FILES_PER_REVIEW` and `MAX_DIFF_CHARS` are deliberately **not** overridable:
+  they are cost guardrails for the operator running the bot, not repo preferences.
+- Configs are cached in-process per `(repo, ref)`, so repeated pushes do not
+  refetch the file.
+
 ## Using a different provider
 
 The reviewer speaks the Anthropic Messages protocol. Configure any compatible gateway

@@ -30,9 +30,9 @@ The pipeline ran and decided there was nothing to do, or failed after accepting.
 logs say which. Common causes:
 
 **No reviewable files.** Everything in the PR was deleted, binary, patch-less, or
-outside `REVIEW_FILE_EXTENSIONS` (default `.py` only). The log line names the
-extensions it was looking for. A PR touching only `.md` and `.yml` is correctly
-skipped.
+outside `REVIEW_FILE_EXTENSIONS` (default `.py` only), or excluded by the repo's
+`.reviewbot.yaml`. The log line names the extensions it was looking for. A PR
+touching only `.md` and `.yml` is correctly skipped.
 
 **Model call failing.** Look for `Error during review:` in the logs. The summary
 comment, if one was posted, carries the same message. `401` means a bad or missing
@@ -121,6 +121,35 @@ it is the only thing enforcing it — and that `annotate_diff` has not been modi
 Issues with an unusable line are stored with `line: null`: they appear in the summary
 and the dashboard but cannot become inline comments, which is the intended fallback.
 
+## Reviews are full when I expected incremental ones
+
+`synchronize` reviews only the delta since the last reviewed commit — unless it
+cannot. Look for these log lines:
+
+- `Compare ... failed ...; doing a full review` — the range exceeded GitHub's
+  compare limits (~250 commits / ~300 files), or a SHA is unknown to GitHub.
+- `History diverged for ...; doing a full review` — the branch was force-pushed or
+  rebased, so the two-commit diff would not be "what is new".
+- `Head ... already reviewed ...; nothing to do` — the delivery is a repeat of one
+  you already processed.
+
+Also note the first push after `opened` is covered by the initial full review;
+incremental deltas start from the second.
+
+## `.reviewbot.yaml` seems to be ignored
+
+- The file must be named exactly `.reviewbot.yaml` and sit at the repository root.
+- It is read at the PR **base** sha. A config file added inside a PR has no effect
+  on that PR — merge it first. This is deliberate: it stops a PR from weakening its
+  own review.
+- Malformed YAML, a non-mapping root, or invalid values (e.g.
+  `min_severity: critical`) log a warning and fall back to the global config.
+- Unknown keys are ignored with a warning — check the spelling against the schema
+  in [configuration.md](configuration.md).
+- Configs are cached per `(repo, ref)`; if you just merged a config change, a
+  restart guarantees the cache is fresh.
+- `MAX_FILES_PER_REVIEW` and `MAX_DIFF_CHARS` cannot be overridden per repo.
+
 ## Dashboard problems
 
 **Empty dashboard.** It reads the database directly, so it is empty until a review has
@@ -139,8 +168,9 @@ project root; that launcher adds `src` to the path. Or `pip install -e .`.
 engine sets `check_same_thread=False` for SQLite. If you see this, something is
 building its own engine or connection instead of using `db/database.py`.
 
-**`no such column`** — you added a column to a model without changing the database.
-`init_db` only creates missing *tables*; it never alters an existing one. Drop
+**`no such column`** — you added a column to a model that is not in
+`_EXPECTED_COLUMNS` in `db/database.py` (the built-in add-column migration) on a
+database that already exists. Register the column there, or drop
 `data/reviewbot.db` locally, or add Alembic. See [database.md](database.md).
 
 **`unable to open database file`** in Docker — no volume mounted at `/app/data`, or it

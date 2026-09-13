@@ -21,6 +21,10 @@ from reviewbot.llm.parser import (
 )
 from reviewbot.llm.reviewer import CodeReviewer
 from reviewbot.utils.config import settings
+from reviewbot.utils.repo_config import (
+    EffectiveReviewConfig,
+    get_repo_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +112,13 @@ async def github_webhook(
 
     commit_sha = (pull_request.get("head") or {}).get("sha")
 
-    background_tasks.add_task(process_pr_review, repo_name, pr_number, commit_sha)
+    background_tasks.add_task(
+        process_pr_review,
+        repo_name,
+        pr_number,
+        commit_sha,
+        incremental=(action == "synchronize"),
+    )
     logger.info("Queued review for %s#%s (%s)", repo_name, pr_number, action)
 
     return {
@@ -119,20 +129,32 @@ async def github_webhook(
     }
 
 
-def reviewable_files(files: Sequence[GitHubFile]) -> List[GitHubFile]:
-    """Keep files that were changed, still exist, and match the configured suffixes."""
+def _default_config() -> "EffectiveReviewConfig":
+    """Global-settings config, built fresh so monkeypatched settings win in tests."""
+    return EffectiveReviewConfig.from_repo_config(None)
+
+
+def reviewable_files(
+    files: Sequence[GitHubFile], config: Optional[Any] = None
+) -> List[GitHubFile]:
+    """Keep files that were changed, still exist, and pass the effective path filter."""
+    cfg = config if config is not None else _default_config()
     keep: List[GitHubFile] = []
     for file in files:
         if file.status == "removed" or not file.patch:
             continue
-        if not file.filename.endswith(settings.review_extensions):
+        if not cfg.is_reviewable_path(file.filename):
             continue
         keep.append(file)
     return keep
 
 
-def collect_inline_comments(result: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Flatten per-file inline comments, most severe first, capped for sanity."""
+def collect_inline_comments(
+    result: Dict[str, Any], config: Optional[Any] = None
+) -> List[Dict[str, Any]]:
+    """Flatten per-file inline comments, severity-gated, most severe first, capped."""
+    cfg = config if config is not None else _default_config()
+    threshold = SEVERITY_ORDER[cfg.min_severity]
     comments: List[Dict[str, Any]] = []
     for review in result.get("file_reviews", []):
         comments.extend(
@@ -143,13 +165,38 @@ def collect_inline_comments(result: Dict[str, Any]) -> List[Dict[str, Any]]:
             )
         )
 
-    comments.sort(key=lambda c: (SEVERITY_ORDER.get(c["severity"], 1), c["file"], c["line"]))
+    gated = [
+        c for c in comments if SEVERITY_ORDER.get(c["severity"], 1) <= threshold
+    ]
+    if len(gated) < len(comments):
+        logger.info(
+            "Severity threshold %s dropped %s inline comment(s)",
+            cfg.min_severity,
+            len(comments) - len(gated),
+        )
 
-    limit = settings.max_inline_comments
-    if len(comments) > limit:
-        logger.info("Capping inline comments at %s (had %s)", limit, len(comments))
-        comments = comments[:limit]
-    return comments
+    gated.sort(key=lambda c: (SEVERITY_ORDER.get(c["severity"], 1), c["file"], c["line"]))
+
+    limit = cfg.max_inline_comments
+    if len(gated) > limit:
+        logger.info("Capping inline comments at %s (had %s)", limit, len(gated))
+        gated = gated[:limit]
+    return gated
+
+
+def get_last_reviewed_sha(repo_name: str, pr_number: int) -> Optional[str]:
+    """Head SHA of the most recent stored review for this PR, if any."""
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(Review.commit_sha)
+            .filter(Review.repo_name == repo_name, Review.pr_number == pr_number)
+            .order_by(Review.created_at.desc(), Review.id.desc())
+            .first()
+        )
+        return row[0] if row else None
+    finally:
+        db.close()
 
 
 def persist_review(
@@ -158,6 +205,8 @@ def persist_review(
     commit_sha: Optional[str],
     result: Dict[str, Any],
     inline_comments: Sequence[Dict[str, Any]],
+    *,
+    base_commit_sha: Optional[str] = None,
 ) -> Tuple[Optional[int], List[int]]:
     """Store the review and its rendered comments. Returns ``(review_id, comment_ids)``."""
     db = SessionLocal()
@@ -166,7 +215,9 @@ def persist_review(
             pr_number=pr_number,
             repo_name=repo_name,
             commit_sha=commit_sha,
+            base_commit_sha=base_commit_sha,
             summary=result.get("summary"),
+            walkthrough=result.get("walkthrough"),
             confidence_score=result.get("average_confidence", 0.0),
             files_reviewed=len(result.get("file_reviews", [])),
             **{
@@ -218,38 +269,110 @@ def mark_posted(comment_ids: Sequence[int]) -> None:
 
 
 def process_pr_review(
-    repo_name: str, pr_number: int, commit_sha: Optional[str] = None
+    repo_name: str,
+    pr_number: int,
+    commit_sha: Optional[str] = None,
+    *,
+    incremental: bool = False,
 ) -> Optional[int]:
     """Review a pull request end to end: fetch, review, store, comment.
 
     Runs in a FastAPI background task, so it swallows its own exceptions - a failed
     review must not take the worker down. Returns the stored review id, if any.
+
+    ``incremental`` (set for ``synchronize`` webhooks) reviews only the changes
+    since the last stored review of this PR, falling back to a full review
+    whenever the delta cannot be computed safely.
     """
     logger.info("Starting review of %s#%s", repo_name, pr_number)
     try:
         client = GitHubClient()
-        reviewer = CodeReviewer()
 
-        files = reviewable_files(client.get_pr_files(repo_name, pr_number))
+        # Head, base and title are all needed up front: the base sha selects the
+        # repo config, the title feeds the walkthrough.
+        pr = client.get_pr(repo_name, pr_number)
+        if not commit_sha:
+            commit_sha = pr.head.sha
+        base_sha = pr.base.sha
+        pr_title = pr.title
+
+        # Per-repo config is read at the PR base sha, so a pull request cannot
+        # weaken its own review.
+        repo_config = get_repo_config(client, repo_name, ref=base_sha)
+        cfg = EffectiveReviewConfig.from_repo_config(repo_config)
+        if not cfg.enabled:
+            logger.info("ReviewBot disabled for %s via .reviewbot.yaml", repo_name)
+            return None
+
+        files: Optional[List[GitHubFile]] = None
+        range_base: Optional[str] = None
+        if incremental:
+            last_sha = get_last_reviewed_sha(repo_name, pr_number)
+            if last_sha and last_sha == commit_sha:
+                logger.info(
+                    "Head %s already reviewed for %s#%s; nothing to do",
+                    (commit_sha or "")[:7],
+                    repo_name,
+                    pr_number,
+                )
+                return None
+            if last_sha:
+                try:
+                    comparison = client.compare_commits(
+                        repo_name, last_sha, commit_sha
+                    )
+                except Exception as exc:  # noqa: BLE001 - fall back to a full review
+                    logger.warning(
+                        "Compare %s..%s failed (%s); doing a full review",
+                        last_sha[:7],
+                        (commit_sha or "")[:7],
+                        exc,
+                    )
+                else:
+                    if comparison.behind_by > 0:
+                        # Force-push or rebase: the diff would not be "what is
+                        # new" and would mislead the model.
+                        logger.warning(
+                            "History diverged for %s#%s; doing a full review",
+                            repo_name,
+                            pr_number,
+                        )
+                    else:
+                        files = comparison.files
+                        range_base = last_sha
+
+        if files is None:
+            files = client.get_pr_files(repo_name, pr_number)
+
+        files = reviewable_files(files, cfg)
         if not files:
             logger.info(
                 "No reviewable files in %s#%s (extensions: %s)",
                 repo_name,
                 pr_number,
-                ", ".join(settings.review_extensions),
+                ", ".join(cfg.extensions),
             )
             return None
 
-        if not commit_sha:
-            commit_sha = client.get_pr(repo_name, pr_number).head.sha
-
+        reviewer = CodeReviewer(config=cfg)
         result = reviewer.review_multiple_files(
-            [{"filename": f.filename, "diff": f.patch or ""} for f in files]
+            [{"filename": f.filename, "diff": f.patch or ""} for f in files],
+            context={
+                "pr_title": pr_title,
+                "incremental": range_base is not None,
+                "base_sha": range_base,
+                "head_sha": commit_sha,
+            },
         )
 
-        inline_comments = collect_inline_comments(result)
+        inline_comments = collect_inline_comments(result, cfg)
         review_id, comment_ids = persist_review(
-            repo_name, pr_number, commit_sha, result, inline_comments
+            repo_name,
+            pr_number,
+            commit_sha,
+            result,
+            inline_comments,
+            base_commit_sha=range_base,
         )
 
         client.post_comment(repo_name, pr_number, format_pr_comment(result))

@@ -75,6 +75,28 @@ Find:
 
 Respond in valid JSON only."""
 
+WALKTHROUGH_SYSTEM_PROMPT = """You are a technical writer producing walkthroughs of code changes.
+
+You receive the title of a change and a list of the files it touched, each with
+a count of issues the review flagged. Write a short plain-English walkthrough of
+what the change does and why, for a reviewer who has not opened the code.
+
+Rules:
+- 2 to 4 sentences, at most about 80 words
+- Explain WHAT the change does and WHY, not a file-by-file restatement
+- No bullet lists, no headers, no emoji
+- For a trivial change, one plain sentence is enough
+- Respond with the walkthrough text only, nothing else"""
+
+WALKTHROUGH_PROMPT_TEMPLATE = """Write a walkthrough of this {change_kind}.
+
+Title: {title}
+
+Files touched (with review findings):
+{file_notes}
+
+Respond with the walkthrough text only."""
+
 
 def _empty_review(summary: str, confidence: float = 0.0) -> Dict[str, Any]:
     """Skeleton review result with no issues."""
@@ -88,9 +110,28 @@ def _empty_review(summary: str, confidence: float = 0.0) -> Dict[str, Any]:
 class CodeReviewer:
     """Reviews diffs with Claude and aggregates the findings."""
 
-    def __init__(self, client: Optional[Any] = None, model: Optional[str] = None):
+    def __init__(
+        self,
+        client: Optional[Any] = None,
+        model: Optional[str] = None,
+        config: Optional[Any] = None,
+    ):
         self._client = client
         self.model = model or settings.anthropic_model
+        self._config = config
+
+    @property
+    def config(self) -> Any:
+        """Effective review guardrails: per-repo config, else the global settings.
+
+        Built fresh on each access so tests that monkeypatch ``settings`` keep
+        working when no explicit config was handed in.
+        """
+        if self._config is None:
+            from reviewbot.utils.repo_config import EffectiveReviewConfig
+
+            return EffectiveReviewConfig.from_repo_config(None)
+        return self._config
 
     @property
     def client(self) -> Any:
@@ -122,13 +163,15 @@ class CodeReviewer:
             review["filename"] = filename
             return review
 
-        if len(annotated) > settings.max_diff_chars:
+        if len(annotated) > self.config.max_diff_chars:
             annotated = (
-                annotated[: settings.max_diff_chars]
+                annotated[: self.config.max_diff_chars]
                 + "\n... (diff truncated for length) ..."
             )
             logger.warning(
-                "Truncated diff for %s at %s chars", filename, settings.max_diff_chars
+                "Truncated diff for %s at %s chars",
+                filename,
+                self.config.max_diff_chars,
             )
 
         try:
@@ -155,15 +198,20 @@ class CodeReviewer:
         return review
 
     def _complete(self, filename: str, annotated_diff: str) -> str:
+        """Review one file through the review prompt."""
+        user_content = USER_PROMPT_TEMPLATE.format(
+            filename=filename, diff=annotated_diff
+        )
+        return self._request(SYSTEM_PROMPT, user_content)
+
+    def _request(
+        self,
+        system_prompt: str,
+        user_content: str,
+        max_tokens: Optional[int] = None,
+    ) -> str:
         """Call the model, retrying transient failures with exponential backoff."""
-        messages = [
-            {
-                "role": "user",
-                "content": USER_PROMPT_TEMPLATE.format(
-                    filename=filename, diff=annotated_diff
-                ),
-            },
-        ]
+        messages = [{"role": "user", "content": user_content}]
 
         attempts = max(1, settings.llm_max_retries + 1)
         last_error: Optional[Exception] = None
@@ -172,9 +220,9 @@ class CodeReviewer:
             try:
                 response = self.client.messages.create(
                     model=self.model,
-                    system=SYSTEM_PROMPT,
+                    system=system_prompt,
                     messages=messages,
-                    max_tokens=settings.llm_max_tokens,
+                    max_tokens=max_tokens or settings.llm_max_tokens,
                     extra_body={"temperature": settings.llm_temperature},
                 )
                 content = "".join(
@@ -192,10 +240,9 @@ class CodeReviewer:
                     break
                 backoff = 2**attempt
                 logger.warning(
-                    "Review attempt %s/%s for %s failed (%s); retrying in %ss",
+                    "Model attempt %s/%s failed (%s); retrying in %ss",
                     attempt + 1,
                     attempts,
-                    filename,
                     exc,
                     backoff,
                 )
@@ -259,13 +306,18 @@ class CodeReviewer:
     # Whole pull request
     # ------------------------------------------------------------------
 
-    def review_multiple_files(self, files: Sequence[Dict[str, str]]) -> Dict[str, Any]:
+    def review_multiple_files(
+        self, files: Sequence[Dict[str, str]], context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """Review several files and aggregate the results.
 
         ``files`` is a sequence of ``{"filename": ..., "diff": ...}`` dicts. The
         result keeps per-file reviews under ``file_reviews`` and also exposes flat
         PR-wide issue lists (each issue tagged with the ``file`` it came from) for
         storage and display.
+
+        ``context`` adds PR-level detail used for the walkthrough and the summary:
+        ``pr_title``, ``incremental``, ``base_sha`` and ``head_sha`` (all optional).
         """
         result: Dict[str, Any] = {
             "file_reviews": [],
@@ -273,6 +325,7 @@ class CodeReviewer:
             "average_confidence": 0.0,
             "summary": "No files to review",
             "total_issues": 0,
+            "walkthrough": None,
         }
         for issue_type in ISSUE_TYPES:
             result[issue_type] = []
@@ -282,7 +335,7 @@ class CodeReviewer:
             return result
 
         selected = list(files)
-        limit = settings.max_files_per_review
+        limit = self.config.max_files_per_review
         if limit > 0 and len(selected) > limit:
             result["skipped_files"] = [f["filename"] for f in selected[limit:]]
             selected = selected[:limit]
@@ -311,8 +364,50 @@ class CodeReviewer:
         result["average_confidence"] = (
             sum(r["confidence"] for r in reviews) / len(reviews) if reviews else 0.0
         )
+
+        ctx = context or {}
+        result["walkthrough"] = self._generate_walkthrough(result, ctx)
+        result["incremental_base"] = ctx.get("base_sha") if ctx.get("incremental") else None
+        result["incremental_head"] = ctx.get("head_sha") if ctx.get("incremental") else None
+
         result["summary"] = self._generate_summary(result)
         return result
+
+    def _generate_walkthrough(
+        self, result: Dict[str, Any], context: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        """One lightweight model call describing what the change does.
+
+        Optional by design: any failure returns None and the summary renders
+        without the section. Skipped entirely when there is nothing to describe.
+        """
+        reviews = result.get("file_reviews") or []
+        if not reviews:
+            return None
+        ctx = context or {}
+        notes = [
+            "- {}: {} issue(s) flagged".format(
+                review["filename"],
+                sum(len(review[t]) for t in ISSUE_TYPES if isinstance(review.get(t), list)),
+            )
+            for review in reviews
+        ]
+        try:
+            raw = self._request(
+                WALKTHROUGH_SYSTEM_PROMPT,
+                WALKTHROUGH_PROMPT_TEMPLATE.format(
+                    change_kind=(
+                        "incremental update" if ctx.get("incremental") else "pull request"
+                    ),
+                    title=ctx.get("pr_title") or "(untitled)",
+                    file_notes="\n".join(notes),
+                ),
+                max_tokens=400,
+            )
+        except Exception as exc:  # noqa: BLE001 - the walkthrough is optional
+            logger.warning("Walkthrough generation failed: %s", exc)
+            return None
+        return raw.strip() or None
 
     def _generate_summary(self, result: Dict[str, Any]) -> str:
         """Render the markdown body posted as the PR-level comment."""
@@ -348,6 +443,23 @@ class CodeReviewer:
                 f"limit and were not reviewed: {names}{more}\n"
             )
 
+        walkthrough_block = ""
+        if result.get("walkthrough"):
+            walkthrough_block = f"\n### 🧭 Walkthrough\n\n{result['walkthrough']}\n"
+
+        incremental_block = ""
+        base = result.get("incremental_base")
+        if base:
+            head = result.get("incremental_head")
+            short_base, short_head = base[:7], (head or "")[:7]
+            range_text = (
+                f"`{short_base}...{short_head}`" if short_head else f"`{short_base}...`"
+            )
+            incremental_block = (
+                f"\n> 🔁 **Incremental review** of {range_text} — "
+                f"{result.get('total_issues', 0)} new finding(s) in this range.\n"
+            )
+
         recommendations: List[str] = []
         if counts["security"]:
             recommendations.append("Resolve the security findings before merging.")
@@ -368,7 +480,7 @@ class CodeReviewer:
 **Files reviewed:** {len(reviews)}
 **Issues found:** {result["total_issues"]}
 **Confidence:** {result["average_confidence"]:.0%}
-
+{incremental_block}{walkthrough_block}
 ### 📊 Breakdown
 | Category | Count |
 | --- | ---: |

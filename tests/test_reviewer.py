@@ -324,7 +324,7 @@ def test_review_multiple_files_handles_no_files():
 
 def test_review_multiple_files_caps_file_count(monkeypatch, sample_diff):
     monkeypatch.setattr(settings, "max_files_per_review", 1)
-    client, completions = fake_client(model_payload(), model_payload())
+    client, completions = fake_client(model_payload(), "Adds a division helper.")
     reviewer = CodeReviewer(client=client)
 
     result = reviewer.review_multiple_files(
@@ -334,7 +334,11 @@ def test_review_multiple_files_caps_file_count(monkeypatch, sample_diff):
         ]
     )
 
-    assert len(completions.calls) == 1
+    # One file review, then one walkthrough call for the surviving file.
+    review_calls = [
+        c for c in completions.calls if "Review this Python" in c["messages"][0]["content"]
+    ]
+    assert len(review_calls) == 1
     assert result["skipped_files"] == ["b.py"]
     assert "exceeded the per-PR review limit" in result["summary"]
 
@@ -343,7 +347,9 @@ def test_review_multiple_files_has_no_file_cap_when_limit_is_zero(
     monkeypatch, sample_diff
 ):
     monkeypatch.setattr(settings, "max_files_per_review", 0)
-    client, completions = fake_client(model_payload(), model_payload())
+    client, completions = fake_client(
+        model_payload(), model_payload(), "Adds helpers to two files."
+    )
     reviewer = CodeReviewer(client=client)
 
     result = reviewer.review_multiple_files(
@@ -353,7 +359,8 @@ def test_review_multiple_files_has_no_file_cap_when_limit_is_zero(
         ]
     )
 
-    assert len(completions.calls) == 2
+    # Two file reviews, then one walkthrough call.
+    assert len(completions.calls) == 3
     assert len(result["file_reviews"]) == 2
     assert result["skipped_files"] == []
     assert "exceeded the per-PR review limit" not in result["summary"]
@@ -365,6 +372,105 @@ def test_client_property_requires_an_api_key(monkeypatch):
 
     with pytest.raises(ValueError, match="ANTHROPIC_AUTH_TOKEN"):
         _ = reviewer.client
+
+
+# -- Walkthrough ---------------------------------------------------------------
+
+
+def test_walkthrough_is_generated_and_rendered(sample_diff):
+    client, messages = fake_client(model_payload(), "Adds a division helper with guards.")
+    reviewer = CodeReviewer(client=client)
+
+    result = reviewer.review_multiple_files([{"filename": "a.py", "diff": sample_diff}])
+
+    assert result["walkthrough"] == "Adds a division helper with guards."
+    # The section sits between the header stats and the breakdown table.
+    summary = result["summary"]
+    assert "### 🧭 Walkthrough" in summary
+    assert summary.index("**Confidence:**") < summary.index("### 🧭 Walkthrough")
+    assert summary.index("### 🧭 Walkthrough") < summary.index("### 📊 Breakdown")
+    # The walkthrough call is a separate, lighter request.
+    walkthrough_call = messages.calls[-1]
+    assert "technical writer" in walkthrough_call["system"]
+    assert walkthrough_call["max_tokens"] == 400
+    assert "a.py: 1 issue(s) flagged" in walkthrough_call["messages"][0]["content"]
+    assert "pull request" in walkthrough_call["messages"][0]["content"]
+
+
+def test_walkthrough_prompt_mentions_incremental_updates(sample_diff):
+    client, messages = fake_client(model_payload(), "Small fix.")
+    reviewer = CodeReviewer(client=client)
+
+    reviewer.review_multiple_files(
+        [{"filename": "a.py", "diff": sample_diff}],
+        context={"incremental": True, "pr_title": "Fix divide", "base_sha": "b" * 40},
+    )
+
+    assert "incremental update" in messages.calls[-1]["messages"][0]["content"]
+    assert "Fix divide" in messages.calls[-1]["messages"][0]["content"]
+
+
+def test_walkthrough_failure_leaves_the_review_intact(sample_diff, monkeypatch):
+    monkeypatch.setattr("reviewbot.llm.reviewer.time.sleep", lambda *_: None)
+    client, _ = fake_client(model_payload(), RuntimeError("walkthrough boom"))
+    reviewer = CodeReviewer(client=client)
+
+    result = reviewer.review_multiple_files([{"filename": "a.py", "diff": sample_diff}])
+
+    assert result["walkthrough"] is None
+    assert "### 🧭 Walkthrough" not in result["summary"]
+    assert result["total_bugs"] == 1
+    assert "AI Code Review" in result["summary"]
+
+
+def test_walkthrough_is_skipped_when_there_are_no_files():
+    client, messages = fake_client()
+    reviewer = CodeReviewer(client=client)
+
+    result = reviewer.review_multiple_files([])
+
+    assert result["walkthrough"] is None
+    assert messages.calls == []
+
+
+def test_incremental_range_is_rendered_in_the_summary(sample_diff):
+    client, _ = fake_client(
+        model_payload(), "Fixes the helper.", model_payload(), "Fixes the helper."
+    )
+    reviewer = CodeReviewer(client=client)
+
+    result = reviewer.review_multiple_files(
+        [{"filename": "a.py", "diff": sample_diff}],
+        context={
+            "incremental": True,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+        },
+    )
+
+    assert "**Incremental review** of `aaaaaaa...bbbbbbb`" in result["summary"]
+    # A full review never shows the incremental note.
+    full = reviewer.review_multiple_files([{"filename": "a.py", "diff": sample_diff}])
+    assert "Incremental review" not in full["summary"]
+
+
+def test_explicit_config_overrides_guardrails(sample_diff, monkeypatch):
+    from reviewbot.utils.repo_config import EffectiveReviewConfig
+
+    monkeypatch.setattr(settings, "max_files_per_review", 0)
+    cfg = EffectiveReviewConfig.from_repo_config(None)
+    cfg.max_files_per_review = 1
+    client, completions = fake_client(model_payload(), "One file.")
+    reviewer = CodeReviewer(client=client, config=cfg)
+
+    result = reviewer.review_multiple_files(
+        [
+            {"filename": "a.py", "diff": sample_diff},
+            {"filename": "b.py", "diff": sample_diff},
+        ]
+    )
+
+    assert result["skipped_files"] == ["b.py"]
 
 
 @pytest.mark.skipif(

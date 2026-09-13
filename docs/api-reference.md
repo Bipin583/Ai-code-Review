@@ -95,8 +95,12 @@ delivery log therefore shows a green tick for events the bot deliberately skippe
 which keeps real failures visible.
 
 `synchronize` fires on every push to an open PR, so a branch pushed ten times gets
-ten reviews. `MAX_FILES_PER_REVIEW=0` reviews every eligible file; set a positive
-value to bound model calls. `MAX_INLINE_COMMENTS` independently bounds comments.
+ten reviews — but each one after the first is **incremental**: only the delta since
+the last reviewed commit is re-reviewed (falling back to a full review when the
+delta cannot be computed safely, e.g. after a force-push). The manual trigger
+(`POST /api/review`) always runs a full review. `MAX_FILES_PER_REVIEW=0` reviews
+every eligible file; set a positive value to bound model calls. `MAX_INLINE_COMMENTS`
+independently bounds comments.
 
 ## Reviews
 
@@ -121,7 +125,9 @@ Most recent first, ordered by `created_at DESC, id DESC`.
       "repo_name": "acme/api",
       "pr_number": 137,
       "commit_sha": "9f2c1ab...",
+      "base_commit_sha": "77fe0d1...",
       "summary": "## 🤖 AI Code Review\n...",
+      "walkthrough": "Adds retries to the payment client and a circuit breaker for the upstream.",
       "confidence_score": 0.86,
       "files_reviewed": 3,
       "created_at": "2026-09-03T16:04:11.512000",
@@ -136,6 +142,11 @@ Most recent first, ordered by `created_at DESC, id DESC`.
 `total` is the count **before** pagination, so `total > offset + len(reviews)` means
 there is another page. The list view omits the issue bodies; fetch one review to get
 them. Timestamps are naive UTC ISO-8601 — no `Z`, no offset.
+
+`base_commit_sha` is `null` for full reviews and holds the start of the reviewed
+range for incremental ones (`base_commit_sha..commit_sha`). `walkthrough` is the
+plain-English change description shown at the top of the summary comment, or `null`
+when the walkthrough call was skipped or failed.
 
 ### `GET /api/reviews/{id}`
 
