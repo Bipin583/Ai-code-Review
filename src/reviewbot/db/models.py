@@ -37,6 +37,9 @@ class Review(Base):
     pr_number = Column(Integer, nullable=False, index=True)
     repo_name = Column(String, nullable=False, index=True)
     commit_sha = Column(String, index=True)
+    # Incremental reviews: the range covered is base_commit_sha..commit_sha.
+    # NULL on a full review; it also makes "last reviewed SHA" lookups auditable.
+    base_commit_sha = Column(String, nullable=True)
 
     # Review results (stored as JSON)
     bugs = Column(JSON, default=list)
@@ -45,6 +48,7 @@ class Review(Base):
     performance_issues = Column(JSON, default=list)
     best_practices = Column(JSON, default=list)
     summary = Column(Text)
+    walkthrough = Column(Text)  # plain-English "what this PR does" (may be NULL)
 
     # Metrics
     confidence_score = Column(Float, default=0.0)

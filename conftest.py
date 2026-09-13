@@ -67,9 +67,12 @@ def _create_schema():
 
 @pytest.fixture(autouse=True)
 def clean_tables():
-    """Every test starts with empty tables."""
+    """Every test starts with empty tables and no cached repo configs."""
     from reviewbot.db.database import SessionLocal
     from reviewbot.db.models import Review, ReviewComment
+    from reviewbot.utils.repo_config import clear_config_cache
+
+    clear_config_cache()
 
     def _truncate():
         db = SessionLocal()

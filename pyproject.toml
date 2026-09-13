@@ -21,6 +21,7 @@ dependencies = [
     "plotly>=5.22.0",
     "pandas>=2.2.0",
     "requests>=2.31.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

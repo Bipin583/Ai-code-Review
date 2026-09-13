@@ -26,6 +26,12 @@ Full documentation lives in [`docs/`](docs/README.md).
 
 - **Automatic PR reviews** — GitHub webhook on `opened`, `synchronize`, `reopened`
   and `ready_for_review`
+- **Incremental reviews** — a new push reviews only the delta since the last
+  reviewed commit, with a safe fallback to a full review
+- **Walkthrough** — a plain-English "what this PR does" paragraph at the top of
+  every summary
+- **Per-repo config** — a `.reviewbot.yaml` in the repository controls path
+  filters, extensions, the inline-comment cap and the severity threshold
 - **Bug detection** — logic errors, edge cases, crash risks
 - **Security scanning** — injection, hardcoded secrets, unsafe operations
 - **Code quality** — smells, complexity, duplication, naming
@@ -47,9 +53,13 @@ POST /webhook/github ──► HMAC-SHA256 signature check
       ▼
 Background task
       │
-      ├─► PyGithub: list changed files, keep reviewable ones
+      ├─► PyGithub: read .reviewbot.yaml at the PR base sha
+      ├─► incremental (synchronize)? compare with the last reviewed
+      │   commit and keep only the delta — else list changed files
+      ├─► keep reviewable files (extensions + include/exclude)
       ├─► annotate each patch with real new-file line numbers
       ├─► LLM (Anthropic Messages API): JSON findings per file
+      ├─► LLM: walkthrough paragraph for the PR
       ├─► SQLite/PostgreSQL: store review + rendered comments
       ├─► PR summary comment
       └─► inline comments on the changed lines
@@ -59,6 +69,11 @@ Diffs are annotated with the line numbers of the *new* file before they reach th
 model, and every returned line number is validated against the set of lines GitHub
 will actually accept a comment on. Findings on lines outside the diff still appear in
 the summary comment, so nothing is dropped silently.
+
+A repository can override part of the review behaviour by committing a
+`.reviewbot.yaml` (path filters, extensions, inline-comment cap, severity threshold,
+on/off switch). It is read at the PR base sha, so a pull request cannot weaken its
+own review. See [docs/configuration.md](docs/configuration.md).
 
 ## Quick start
 
@@ -210,7 +225,7 @@ src/reviewbot/
 ├── llm/          diff annotation, prompting, response parsing, comment rendering
 ├── db/           SQLAlchemy engine, session and models
 ├── dashboard/    Streamlit UI
-└── utils/        settings
+└── utils/        settings + per-repo .reviewbot.yaml loading
 configs/          re-export shim: `from configs.settings import settings`
 dashboard/app.py  launcher for `streamlit run`
 tests/            pytest suite

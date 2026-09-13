@@ -47,13 +47,14 @@
 | `api/main.py` | App assembly, CORS, lifespan, `/` and `/health` | `app`, `lifespan`, `health` |
 | `api/webhooks.py` | Signature verification, event filtering, the review pipeline | `github_webhook`, `process_pr_review` |
 | `api/routes.py` | Dashboard read APIs and the manual trigger | `list_reviews`, `get_metrics`, `trigger_review` |
-| `github/client.py` | Thin PyGithub wrapper: read PR files, post comments | `GitHubClient.get_pr_files`, `post_inline_comments` |
-| `github/models.py` | Pydantic views of GitHub payloads | `GitHubFile`, `GitHubPR`, `WebhookPayload` |
-| `llm/reviewer.py` | Prompting, retries, response normalization, aggregation | `CodeReviewer.review_file`, `review_multiple_files` |
+| `github/client.py` | Thin PyGithub wrapper: read PR files, compare commits, fetch repo config, post comments | `GitHubClient.get_pr_files`, `compare_commits`, `get_contents`, `post_inline_comments` |
+| `github/models.py` | Pydantic views of GitHub payloads | `GitHubFile`, `GitHubPR`, `ComparisonResult`, `WebhookPayload` |
+| `llm/reviewer.py` | Prompting, retries, response normalization, aggregation, walkthrough | `CodeReviewer.review_file`, `review_multiple_files`, `_generate_walkthrough` |
 | `llm/parser.py` | Diff annotation and GitHub comment rendering | `annotate_diff`, `format_inline_comments` |
 | `db/models.py` | ORM models | `Review`, `ReviewComment` |
-| `db/database.py` | Engine, session factory, schema bootstrap | `engine`, `SessionLocal`, `init_db` |
+| `db/database.py` | Engine, session factory, schema bootstrap + add-column migration | `engine`, `SessionLocal`, `init_db` |
 | `utils/config.py` | Single source of configuration truth | `Settings`, `settings` |
+| `utils/repo_config.py` | Per-repo `.reviewbot.yaml`: parse, validate, cache, merge over globals | `RepoConfig`, `EffectiveReviewConfig`, `get_repo_config` |
 | `dashboard/app.py` | Streamlit UI over the read APIs | `main` |
 
 ## Request lifecycle
@@ -112,6 +113,28 @@ no credentials configured. Only the code paths that need a secret fail.
 breakdown table and recommendations; inline comments carry individual findings.
 Findings whose line is not commentable are dropped from the inline set but remain
 in the summary, so nothing is silently discarded.
+
+**Incremental reviews trust the database, not the payload.** On `synchronize` the
+delta starts at the most recent stored `Review.commit_sha`, not the webhook's
+`before` field: a lost webhook would leave `before` pointing at a commit that was
+never reviewed, and the delta would silently skip it. The database can only point
+at commits the bot actually reviewed. When the delta cannot be computed safely —
+compare failure, or `behind_by > 0` after a force-push — the pipeline falls back to
+a full review rather than reviewing a wrong diff.
+
+**Repo config is read at the PR base sha.** `.reviewbot.yaml` is fetched through
+`GitHubClient.get_contents` with the PR's base ref, cached per `(repo, ref)`, and
+merged over the global settings as an `EffectiveReviewConfig` that is threaded
+through file selection, the inline-comment gate, and the reviewer. Reading it at
+the base means a PR cannot weaken its own review by shipping an `enabled: false`
+config. `max_files_per_review` and `max_diff_chars` stay global-only — they are
+the operator's cost guardrails.
+
+**The walkthrough is a separate, optional call.** Extending the per-file JSON
+schema would couple the walkthrough to a response that already occasionally fails
+to parse. Instead one lightweight plain-text call runs after aggregation, using
+only the PR title and per-file finding counts, and any failure just omits the
+section.
 
 **The provider is configuration, not code.** The reviewer uses the Anthropic Messages
 API at `ANTHROPIC_BASE_URL`, so switching to a compatible gateway is an `.env` edit.

@@ -5,30 +5,62 @@ Everything below runs inside `process_pr_review` (`src/reviewbot/api/webhooks.py
 in a FastAPI background thread.
 
 ```
-get_pr_files ──► reviewable_files ──► for each file:
-                                        annotate_diff
-                                        build prompt
-                                        call model (retry/backoff)
-                                        parse + normalize JSON
-                                      ──► aggregate ──► render summary
-                                                    ──► render inline comments
-                                                    ──► validate lines, dedupe, cap
-                                                    ──► persist
-                                                    ──► post summary comment
-                                                    ──► post inline comments
-                                                    ──► flag what GitHub accepted
+get_pr ──► read .reviewbot.yaml at the base sha
+        ──► incremental? compare with the last reviewed commit ──► delta files
+                                                          └── fallback ──► get_pr_files
+        ──► reviewable_files (extensions + include/exclude)
+        ──► for each file:
+              annotate_diff
+              build prompt
+              call model (retry/backoff)
+              parse + normalize JSON
+            ──► aggregate ──► walkthrough call
+                            ──► render summary
+                            ──► render inline comments
+                            ──► severity gate, validate lines, dedupe, cap
+                            ──► persist
+                            ──► post summary comment
+                            ──► post inline comments
+                            ──► flag what GitHub accepted
 ```
 
 ## 1. File selection
 
-`reviewable_files` drops three kinds of file before any tokens are spent:
+`reviewable_files` drops several kinds of file before any tokens are spent:
 
 - `status == "removed"` — there is no new version to comment on
 - no `patch` — binary files, or changes too large for GitHub to return a patch
-- a suffix outside `REVIEW_FILE_EXTENSIONS` (default `.py`)
+- a path outside the effective config: the extension list (global
+  `REVIEW_FILE_EXTENSIONS`, or `extensions:` from `.reviewbot.yaml`) plus the
+  repo config's `include`/`exclude` globs
 
-If nothing survives, the pipeline logs which extensions it was looking for and
-returns without calling the model or posting anything.
+If the repo config sets `enabled: false`, or nothing survives the filter, the
+pipeline logs and returns without calling the model or posting anything.
+
+## 1a. Incremental reviews
+
+A `synchronize` webhook (a new push) sets `incremental=True`. Instead of re-reviewing
+the whole PR, the pipeline:
+
+1. Looks up the most recent stored `Review` for the PR — its `commit_sha` is the
+   last head the bot actually reviewed. (The webhook payload's `before` field is
+   deliberately ignored: if a webhook was ever lost, `before` would point at a
+   commit that was never reviewed and the delta would silently skip it.)
+2. If that SHA equals the new head, the event is a repeat delivery — nothing to do.
+3. Otherwise it calls `compare_commits(last_sha, head)` and reviews only the
+   returned files, which is cheaper and keeps the summary focused on what changed.
+
+Two conditions force a full review instead:
+
+- **The compare call fails** — unknown SHA, or a range beyond GitHub's ~250-commit /
+  ~300-file compare limit.
+- **`behind_by > 0`** — the branch history diverged (force-push or rebase), so the
+  two-commit diff is not "what is new" and would mislead the model.
+
+Incremental reviews are marked in the database (`reviews.base_commit_sha` holds the
+start of the reviewed range) and in the summary comment, which notes the commit
+range and the number of new findings. `opened`, `reopened` and `ready_for_review`
+are always full reviews — that is what a reader expects when a draft goes ready.
 
 ## 2. Diff annotation
 
@@ -134,7 +166,14 @@ Sorting is `(severity rank, file)` with `high` first — the summary's "key issu
 section is a slice of an already-sorted list, so the five things you see are the five
 most severe. `average_confidence` is the unweighted mean across files.
 
-The summary body is rendered by `_generate_summary`: counts table, up to five key
+After aggregation, one extra lightweight model call produces the **walkthrough**: a
+2–4 sentence plain-English description of what the change does, generated from the
+PR title and the per-file finding counts — no diff content is sent. It is optional
+by design: on any model failure it is simply omitted and the summary renders
+without the section.
+
+The summary body is rendered by `_generate_summary`: an incremental-review note with
+the commit range when applicable, the walkthrough, counts table, up to five key
 security and bug findings with `file:line`, up to five files that came back clean, a
 warning listing any files skipped over the limit, and recommendations derived from
 which categories are non-empty.
@@ -149,8 +188,11 @@ which categories are non-empty.
    the check that prevents `422 Unprocessable Entity` from GitHub.
 3. Duplicates are removed on `(filename, line, issue_type, description)`, so the same
    finding reported under two categories appears once.
-4. The result is sorted by `(severity rank, file, line)` and truncated to
-   `MAX_INLINE_COMMENTS`.
+4. Findings below the effective `min_severity` (from `.reviewbot.yaml`, default
+   `low` = everything) are dropped. The summary still lists them — the threshold
+   controls GitHub notification noise, not the record.
+5. The result is sorted by `(severity rank, file, line)` and truncated to the
+   effective `MAX_INLINE_COMMENTS`.
 
 Because the list is sorted before it is truncated, the cap removes the least severe
 comments, never the important ones.
@@ -168,9 +210,10 @@ are counted and `mark_comments_posted` flags exactly those rows, which is why
 
 ## 9. Cost and latency
 
-One model call per reviewable file, sequential. Wall-clock time is roughly
-`files × per-call latency`, and per-call latency depends entirely on your provider
-and model — measure it before pointing this at a busy repository. The default
-`MAX_FILES_PER_REVIEW=0` does not bound calls; use a positive value for that.
+One model call per reviewable file plus one walkthrough call, sequential. Wall-clock
+time is roughly `files × per-call latency`, and per-call latency depends entirely on
+your provider and model — measure it before pointing this at a busy repository. The
+default `MAX_FILES_PER_REVIEW=0` does not bound calls; use a positive value for that.
 `MAX_DIFF_CHARS` bounds per-file input, and `LLM_MAX_TOKENS` bounds per-file output.
-Note that `synchronize` events mean a review per push, not per PR.
+`synchronize` events mean a review per push, not per PR — but incremental reviews
+mean each of those only covers the delta since the last push, not the whole PR.

@@ -181,3 +181,93 @@ def test_github_errors_propagate():
 
     with pytest.raises(GithubException):
         client.get_repo("octocat/missing")
+
+
+# -- compare_commits -----------------------------------------------------------
+
+
+def fake_comparison(files=None, ahead_by=1, behind_by=0):
+    comparison = MagicMock()
+    comparison.files = files if files is not None else [fake_file("delta.py")]
+    comparison.total_commits = ahead_by
+    comparison.ahead_by = ahead_by
+    comparison.behind_by = behind_by
+    return comparison
+
+
+def test_compare_commits_maps_files_and_metadata():
+    client, _, repo, _, _ = build_client()
+    repo.compare.return_value = fake_comparison(
+        files=[fake_file("a.py"), fake_file("b.py", status="added")], ahead_by=3
+    )
+
+    result = client.compare_commits("octocat/demo", "b" * 40, "c" * 40)
+
+    repo.compare.assert_called_once_with("b" * 40, "c" * 40)
+    assert [f.filename for f in result.files] == ["a.py", "b.py"]
+    assert result.files[0].patch.startswith("@@")
+    assert result.ahead_by == 3
+    assert result.behind_by == 0
+
+
+def test_compare_commits_propagates_github_errors():
+    client, _, repo, _, _ = build_client()
+    repo.compare.side_effect = GithubException(400, {"message": "too many commits"}, {})
+
+    with pytest.raises(GithubException):
+        client.compare_commits("octocat/demo", "b" * 40, "c" * 40)
+
+
+# -- get_contents --------------------------------------------------------------
+
+
+def fake_content_file(text=b"max_inline_comments: 3\n", type_="file"):
+    content = MagicMock()
+    content.type = type_
+    content.decoded_content = text
+    return content
+
+
+def test_get_contents_decodes_file_text():
+    client, _, repo, _, _ = build_client()
+    repo.get_contents.return_value = fake_content_file()
+
+    text = client.get_contents("octocat/demo", ".reviewbot.yaml", ref="d" * 40)
+
+    repo.get_contents.assert_called_once_with(".reviewbot.yaml", ref="d" * 40)
+    assert text == "max_inline_comments: 3\n"
+
+
+def test_get_contents_returns_none_on_404():
+    client, _, repo, _, _ = build_client()
+    repo.get_contents.side_effect = GithubException(404, {"message": "Not Found"}, {})
+
+    assert client.get_contents("octocat/demo", ".reviewbot.yaml") is None
+
+
+def test_get_contents_returns_none_for_directories():
+    client, _, repo, _, _ = build_client()
+    repo.get_contents.return_value = [fake_content_file(), fake_content_file()]
+
+    assert client.get_contents("octocat/demo", "docs") is None
+
+
+def test_get_contents_returns_none_for_non_file_types():
+    client, _, repo, _, _ = build_client()
+    repo.get_contents.return_value = fake_content_file(type_="symlink")
+
+    assert client.get_contents("octocat/demo", "link") is None
+
+
+def test_get_contents_returns_none_for_undecodable_content():
+    client, _, repo, _, _ = build_client()
+    repo.get_contents.return_value = fake_content_file(text=b"\xff\xfe\x00")
+
+    assert client.get_contents("octocat/demo", "image.bin") is None
+
+
+def test_get_contents_logs_and_returns_none_on_other_errors():
+    client, _, repo, _, _ = build_client()
+    repo.get_contents.side_effect = GithubException(403, {"message": "rate limited"}, {})
+
+    assert client.get_contents("octocat/demo", ".reviewbot.yaml") is None

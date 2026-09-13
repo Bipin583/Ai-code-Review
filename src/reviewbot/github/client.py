@@ -13,7 +13,7 @@ from github import Github, GithubException
 
 from reviewbot.utils.config import settings
 
-from .models import GitHubFile, GitHubPR
+from .models import ComparisonResult, GitHubFile, GitHubPR
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,54 @@ class GitHubClient:
     def get_commit(self, repo_name: str, commit_sha: str):
         """Get commit details."""
         return self.get_repo(repo_name).get_commit(commit_sha)
+
+    def compare_commits(
+        self, repo_name: str, base: str, head: str
+    ) -> ComparisonResult:
+        """Files changed between two commits (cumulative diff, NEW-file line numbers).
+
+        Raises whatever PyGithub raises (404 for unknown SHAs, 4xx when the range
+        exceeds GitHub's ~250-commit / ~300-file compare limits); callers are
+        expected to fall back to a full review.
+        """
+        comparison = self.get_repo(repo_name).compare(base, head)
+        return ComparisonResult(
+            files=[
+                GitHubFile(
+                    filename=f.filename,
+                    status=f.status,
+                    additions=f.additions,
+                    deletions=f.deletions,
+                    changes=f.changes,
+                    patch=f.patch,
+                    raw_url=f.raw_url,
+                    blob_url=f.blob_url,
+                )
+                for f in comparison.files
+            ],
+            total_commits=comparison.total_commits,
+            ahead_by=comparison.ahead_by,
+            behind_by=comparison.behind_by,
+        )
+
+    def get_contents(
+        self, repo_name: str, path: str, ref: Optional[str] = None
+    ) -> Optional[str]:
+        """UTF-8 text of a file at a ref, or None when missing / not a plain file."""
+        try:
+            content = self.get_repo(repo_name).get_contents(path, ref=ref)
+        except GithubException as exc:
+            if getattr(exc, "status", None) == 404:
+                return None
+            logger.error("Failed to fetch %s from %s: %s", path, repo_name, exc)
+            return None
+        if isinstance(content, list) or content.type != "file":
+            return None
+        try:
+            return content.decoded_content.decode("utf-8")
+        except (AttributeError, UnicodeDecodeError) as exc:
+            logger.warning("Could not decode %s from %s: %s", path, repo_name, exc)
+            return None
 
     # -- Writes ------------------------------------------------------------
 

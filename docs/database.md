@@ -28,12 +28,14 @@ tool; see the schema-change note at the end.
 | `pr_number` | Integer, indexed | |
 | `repo_name` | String, indexed | `owner/repo` |
 | `commit_sha` | String | head SHA the review ran against |
+| `base_commit_sha` | String, nullable | incremental reviews: the range covered is `base_commit_sha..commit_sha`; NULL on a full review |
 | `bugs` | JSON | list of issue objects |
 | `security_issues` | JSON | |
 | `code_smells` | JSON | |
 | `performance_issues` | JSON | |
 | `best_practices` | JSON | |
 | `summary` | Text | the rendered markdown posted to the PR |
+| `walkthrough` | Text, nullable | plain-English "what this PR does" paragraph |
 | `confidence_score` | Float | mean across files, 0.0–1.0 |
 | `files_reviewed` | Integer | |
 | `created_at` | DateTime | naive UTC |
@@ -144,9 +146,17 @@ remembering that SQLite stores the JSON columns as text.
 
 ## Changing the schema
 
-`init_db` only issues `CREATE TABLE IF NOT EXISTS` — it will not alter an existing
-table. If you add a column, either drop the local `data/reviewbot.db` and let it be
-recreated, or add Alembic (`pip install alembic`, `alembic init`, point
-`sqlalchemy.url` at `DATABASE_URL`, autogenerate against `Base.metadata`). Alembic is
-the right answer as soon as there is data you care about, which in practice means
-before the first production deploy.
+`init_db` issues `CREATE TABLE IF NOT EXISTS`, which never alters an existing table.
+For columns added after the first release it also runs a small built-in migration:
+`_add_missing_columns` in `db/database.py` compares the columns named in
+`_EXPECTED_COLUMNS` against what the database actually has and issues
+`ALTER TABLE ... ADD COLUMN` for the missing ones. Both post-release columns so far
+(`reviews.base_commit_sha`, `reviews.walkthrough`) are nullable, which is what makes
+plain `ALTER TABLE` portable across SQLite and PostgreSQL.
+
+If you add a column yourself, register it in `_EXPECTED_COLUMNS` (or drop the local
+`data/reviewbot.db` and let it be recreated, or adopt Alembic — `pip install alembic`,
+`alembic init`, point `sqlalchemy.url` at `DATABASE_URL`, autogenerate against
+`Base.metadata`). Alembic is the right answer as soon as you want anything richer
+than "add a nullable column", which in practice means before the first production
+deploy.
