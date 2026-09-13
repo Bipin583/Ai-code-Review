@@ -1,0 +1,57 @@
+# Render blueprint for the ReviewBot AI deployment.
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Single web service running the repo's Dockerfile (uvicorn FastAPI app,
+# binds to $PORT, /health endpoint). The Streamlit dashboard is not part of
+# this service; review it locally or deploy it separately later.
+#
+# Free plan: no persistent disk, so the SQLite database is recreated empty on
+# every deploy/restart, and the service sleeps after ~15 minutes of inactivity
+# (first request after that pays a ~30-60s cold start). Upgrade the plan and
+# add a disk mounted at /app/data for persistence.
+
+services:
+  - type: web
+    name: reviewbot-ai
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # The Dockerfile's HEALTHCHECK probes /health.
+    healthCheckPath: /health
+    plan: free
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DATABASE_URL
+        value: sqlite:///./data/reviewbot.db
+      - key: CORS_ORIGINS
+        value: "*"
+      # Review guardrails (defaults from src/reviewbot/utils/config.py).
+      - key: MAX_FILES_PER_REVIEW
+        value: "0"
+      - key: MAX_DIFF_CHARS
+        value: "12000"
+      - key: MAX_INLINE_COMMENTS
+        value: "25"
+      - key: REVIEW_FILE_EXTENSIONS
+        value: ".py"
+      # LLM gateway (Settings defaults; override if you use AgentRouter).
+      - key: ANTHROPIC_BASE_URL
+        value: https://api.anthropic.com
+      - key: ANTHROPIC_MODEL
+        value: gpt-5.6-sol
+      - key: LLM_TEMPERATURE
+        value: "0.2"
+      - key: LLM_MAX_TOKENS
+        value: "2000"
+      - key: LLM_MAX_RETRIES
+        value: "2"
+      # Secrets -- set these in the Render dashboard on first deploy.
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_WEBHOOK_SECRET
+        sync: false
+      - key: ANTHROPIC_AUTH_TOKEN
+        sync: false
