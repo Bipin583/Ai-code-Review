@@ -1,0 +1,92 @@
+name: ConfTest AI Failure Analysis
+
+# This privileged workflow must exist on the default branch before workflow_run
+# events can trigger it. It never checks out or executes pull-request code.
+# Tracked workflow: "ConfTest RTS" (this repository's caller workflow, which
+# delegates to Bipin583/Conftest's reusable selection workflow).
+on:
+  workflow_run:
+    workflows: ["ConfTest RTS"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: conftest-ai-analysis-${{ github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+jobs:
+  analyze-failure:
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.pull_requests[0].number != null
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout trusted analyzer
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install trusted analyzer dependencies
+        run: python -m pip install "requests==2.32.3"
+
+      - name: Analyze failed workflow logs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: claude-sonnet-5
+        run: >-
+          python scripts/analyze_ci_failure.py
+          --output "${{ runner.temp }}/conftest-ai-analysis.md"
+
+      - name: Post or update advisory PR comment
+        uses: actions/github-script@v8
+        env:
+          REPORT_PATH: ${{ runner.temp }}/conftest-ai-analysis.md
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- conftest-ai-failure-analysis -->';
+            const body = fs.readFileSync(process.env.REPORT_PATH, 'utf8');
+            if (!body.startsWith(marker)) {
+              core.setFailed('Analyzer report is missing its expected marker.');
+              return;
+            }
+            const issue_number = Number(process.env.PR_NUMBER);
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find(comment => comment.body?.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body,
+              });
+            }

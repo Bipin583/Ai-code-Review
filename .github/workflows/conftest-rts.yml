@@ -1,0 +1,31 @@
+# ConfTest intelligent regression test selection for ReviewBot AI PRs.
+#
+# Delegates to the reusable workflow in Bipin583/Conftest, which checks out
+# both repos, runs the selection engine against this repository's pytest
+# suite, executes the selected tests, and posts a report comment on the PR.
+# The existing tests.yml full-suite matrix stays as ground truth; this runs
+# alongside it for comparison.
+#
+# No secrets block: the workflow runs with this repo's GITHUB_TOKEN, which
+# flows into the reusable workflow automatically for the PR comment.
+
+name: ConfTest RTS
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: conftest-rts-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  conftest-rts:
+    uses: Bipin583/Conftest/.github/workflows/conftest-rts-reusable.yml@main
+    with:
+      budget: 0.25
